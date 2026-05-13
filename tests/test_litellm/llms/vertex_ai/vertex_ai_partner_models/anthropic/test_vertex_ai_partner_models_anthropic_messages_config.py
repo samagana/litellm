@@ -313,6 +313,189 @@ def test_transform_anthropic_messages_request_removes_scope_from_cache_control()
     assert result["messages"][0]["content"][0]["cache_control"]["type"] == "ephemeral"
 
 
+def test_clear_thinking_injects_minimal_enabled_thinking_when_thinking_absent():
+    """
+    Vertex rejects ``clear_thinking_20251015`` unless thinking is enabled or adaptive.
+    When the client sends the strategy without thinking, inject a minimal enabled config.
+    """
+    config = VertexAIPartnerModelsAnthropicMessagesConfig()
+    anthropic_messages_optional_request_params = {
+        "max_tokens": 32000,
+        "context_management": {
+            "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+        },
+    }
+
+    result = config.transform_anthropic_messages_request(
+        model="claude-sonnet-4-6",
+        messages=[{"role": "user", "content": "hello"}],
+        anthropic_messages_optional_request_params=anthropic_messages_optional_request_params,
+        litellm_params=GenericLiteLLMParams(),
+        headers={},
+    )
+
+    assert result["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+
+
+def test_clear_thinking_does_not_overwrite_existing_enabled_thinking():
+    """
+    On non-adaptive models, an existing ``thinking={type: enabled}`` config must be
+    preserved rather than smashed by the minimal injection budget.
+    """
+    config = VertexAIPartnerModelsAnthropicMessagesConfig()
+    anthropic_messages_optional_request_params = {
+        "max_tokens": 32000,
+        "thinking": {"type": "enabled", "budget_tokens": 5000},
+        "context_management": {
+            "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+        },
+    }
+
+    result = config.transform_anthropic_messages_request(
+        model="claude-3-7-sonnet",
+        messages=[{"role": "user", "content": "hello"}],
+        anthropic_messages_optional_request_params=anthropic_messages_optional_request_params,
+        litellm_params=GenericLiteLLMParams(),
+        headers={},
+    )
+
+    assert result["thinking"] == {"type": "enabled", "budget_tokens": 5000}
+
+
+def test_clear_thinking_does_not_overwrite_adaptive_thinking():
+    config = VertexAIPartnerModelsAnthropicMessagesConfig()
+    anthropic_messages_optional_request_params = {
+        "max_tokens": 32000,
+        "thinking": {"type": "adaptive"},
+        "context_management": {
+            "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+        },
+    }
+
+    result = config.transform_anthropic_messages_request(
+        model="claude-sonnet-4-6",
+        messages=[{"role": "user", "content": "hello"}],
+        anthropic_messages_optional_request_params=anthropic_messages_optional_request_params,
+        litellm_params=GenericLiteLLMParams(),
+        headers={},
+    )
+
+    assert result["thinking"] == {"type": "adaptive"}
+
+
+def test_clear_thinking_no_injection_for_unrelated_edit_type():
+    config = VertexAIPartnerModelsAnthropicMessagesConfig()
+    anthropic_messages_optional_request_params = {
+        "max_tokens": 32000,
+        "context_management": {"edits": [{"type": "compact_20260112"}]},
+    }
+
+    result = config.transform_anthropic_messages_request(
+        model="claude-sonnet-4-6",
+        messages=[{"role": "user", "content": "hello"}],
+        anthropic_messages_optional_request_params=anthropic_messages_optional_request_params,
+        litellm_params=GenericLiteLLMParams(),
+        headers={},
+    )
+
+    assert "thinking" not in result
+
+
+def test_clear_thinking_skips_injection_when_max_tokens_too_small():
+    config = VertexAIPartnerModelsAnthropicMessagesConfig()
+    anthropic_messages_optional_request_params = {
+        "max_tokens": 512,
+        "context_management": {
+            "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+        },
+    }
+
+    result = config.transform_anthropic_messages_request(
+        model="claude-sonnet-4-6",
+        messages=[{"role": "user", "content": "hello"}],
+        anthropic_messages_optional_request_params=anthropic_messages_optional_request_params,
+        litellm_params=GenericLiteLLMParams(),
+        headers={},
+    )
+
+    assert "thinking" not in result
+
+
+def test_clear_thinking_adds_interleaved_thinking_beta_header():
+    """When thinking is injected, the interleaved-thinking beta header must accompany it."""
+    config = VertexAIPartnerModelsAnthropicMessagesConfig()
+    headers = {}
+    litellm_params = {
+        "vertex_ai_project": "test-project",
+        "vertex_ai_location": "us-central1",
+        "vertex_credentials": "{}",
+    }
+    optional_params = {
+        "context_management": {
+            "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+        },
+    }
+
+    with (
+        patch.object(
+            config, "_ensure_access_token", return_value=("token", "test-project")
+        ),
+        patch.object(
+            config, "get_complete_vertex_url", return_value="https://mock-url"
+        ),
+    ):
+        updated_headers, _ = config.validate_anthropic_messages_environment(
+            headers=headers,
+            model="claude-sonnet-4-6",
+            messages=[],
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+            api_base=None,
+        )
+
+    assert "anthropic-beta" in updated_headers
+    beta_set = {b.strip() for b in updated_headers["anthropic-beta"].split(",")}
+    assert "interleaved-thinking-2025-05-14" in beta_set
+    assert "context-management-2025-06-27" in beta_set
+
+
+def test_clear_thinking_skips_interleaved_beta_when_thinking_already_enabled():
+    """If client already enabled thinking, no need to add interleaved-thinking beta."""
+    config = VertexAIPartnerModelsAnthropicMessagesConfig()
+    headers = {}
+    litellm_params = {
+        "vertex_ai_project": "test-project",
+        "vertex_ai_location": "us-central1",
+        "vertex_credentials": "{}",
+    }
+    optional_params = {
+        "thinking": {"type": "adaptive"},
+        "context_management": {
+            "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+        },
+    }
+
+    with (
+        patch.object(
+            config, "_ensure_access_token", return_value=("token", "test-project")
+        ),
+        patch.object(
+            config, "get_complete_vertex_url", return_value="https://mock-url"
+        ),
+    ):
+        updated_headers, _ = config.validate_anthropic_messages_environment(
+            headers=headers,
+            model="claude-sonnet-4-6",
+            messages=[],
+            optional_params=optional_params,
+            litellm_params=litellm_params,
+            api_base=None,
+        )
+
+    beta_set = {b.strip() for b in updated_headers.get("anthropic-beta", "").split(",")}
+    assert "interleaved-thinking-2025-05-14" not in beta_set
+
+
 def test_provider_config_manager_reuses_vertex_anthropic_messages_config_instance():
     """
     Regression test: repeated provider config lookups for the same Vertex Claude model
